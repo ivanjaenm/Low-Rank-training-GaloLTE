@@ -82,7 +82,7 @@ def parse_args(args):
     args = args_utils.check_args_torchrun_main(args)
     return args
 
-
+####------------------ USE FOR INFERENCING ONLY ---------------------###
 @torch.no_grad()
 def evaluate_model(model, preprocess_batched, pad_idx, global_rank, world_size, device, batch_size):
     _time = time.time()
@@ -128,13 +128,13 @@ def evaluate_model(model, preprocess_batched, pad_idx, global_rank, world_size, 
 
     return total_loss, evaluated_on_tokens
 
-
+####------------------ MAIN TRAINING ROUTINE ---------------------###
 def main(args):
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     random.seed(args.seed)
 
-    # to enable DDP
+    #-------------------------- TO DO: enable DDP --------------------#
     assert "LOCAL_RANK" in os.environ, "torchrun should set LOCAL_RANK"
     global_rank = int(os.environ['RANK'])
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -154,22 +154,23 @@ def main(args):
 
     assert args.gradient_accumulation * args.batch_size * world_size == args.total_batch_size, \
         "gradient_accumulation * batch_size * world_size must be equal to total_batch_size"
+    #-------------------------- TO DO: enable DDP --------------------#
 
+    #-------------------------- Starting logger --------------------#
     # turn off logger
-    if global_rank != 0: logger.remove()
-            
+    if global_rank != 0: logger.remove()            
     # initialize wandb without config (it is passed later)
     if global_rank == 0:
         wandb.init(project="galore-c4")
-        
     logger.info(f"Using dist with rank {global_rank} (only rank 0 will log)")
     logger.info("*" * 40)
     logger.info(f"Starting training with the arguments")
     for k, v in vars(args).items():
         logger.info(f"{k:30} {v}")
     logger.info("*" * 40)
+    #-------------------------- Starting logger --------------------#
 
-    # specify DATASET
+    #-------------------------- Loading DATASET --------------------#
     data = datasets.load_dataset("allenai/c4", "en", split="train", streaming=True)
     seed_for_shuffle = 42 
     logger.info(f"Shuffling data with seed {seed_for_shuffle}")
@@ -195,21 +196,26 @@ def main(args):
 
     dataset = PreprocessedIterableDataset(data, tokenizer, batch_size=args.batch_size, max_length=args.max_length)
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=None, num_workers=args.workers)
+    #-------------------------- Loading DATASET --------------------#
 
-    # specify MODEL
-    model_config = AutoConfig.from_pretrained(args.model_config)
-    if args.use_hf_model:
-        model: HF_LlamaForCausalLM = AutoModelForCausalLM.from_config(model_config)
-    else:
-        model = LlamaForCausalLM(model_config)
-
-    # nanoGPT
-    model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout)
+    #-------------------------- Specifying MODEL --------------------#
     
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
-        
+    with open(args.model_config) as f:
+        model_config = json.load(f)
+    if model_config["name"] == "gpt_nano":
+        model_args = model_config; del model_args['name']
+        print(model_args)
+        gptconf = GPTConfig(**model_args)
+        model = GPT(gptconf)
+    else:
+        model_config = AutoConfig.from_pretrained(args.model_config)
+        if args.use_hf_model:
+            model: HF_LlamaForCausalLM = AutoModelForCausalLM.from_config(model_config)
+        else:
+            model = LlamaForCausalLM(model_config)
+
+    #-------------------------- Specifying MODEL --------------------#
+
     if args.activation_checkpointing:
         model.gradient_checkpointing_enable()
 
@@ -575,6 +581,7 @@ def main(args):
     print(f"Rank {global_rank} finished successfully")
 
 
+####------------------ ENTRY POINT FOR EXECUTION ---------------------###
 if __name__ == "__main__":
     print("Starting script")
     args = parse_args(None)

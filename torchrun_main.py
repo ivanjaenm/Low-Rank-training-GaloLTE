@@ -13,23 +13,27 @@ import torch.distributed as dist
 import transformers
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
 from transformers import LlamaForCausalLM as HF_LlamaForCausalLM
+from transformers import GPT2Config, GPT2Model
 
 import datasets
 import datasets.distributed
-import wandb
 
+# for logging purposes
+import wandb
 from tqdm import tqdm
 from loguru import logger
+import bitsandbytes as bnb
 
 from peft_pretraining import training_utils, args_utils
 from peft_pretraining.dataloader import PreprocessedIterableDataset
-from peft_pretraining.modeling_llama import LlamaForCausalLM
+from peft_pretraining.modeling_llama import LlamaForCausalLM #for Llama model
+from peft_pretraining.modeling_gpt import GPTConfig, GPT # for gpt model
 
-import bitsandbytes as bnb
-# from GaLore
+# Galore optimizers
 from galore_torch import GaLoreAdamW, GaLoreAdamW8bit, GaLoreAdafactor
-# from nanoGPT
-from model import GPTConfig, GPT
+# LTE adapters
+from lte import LTEConfig, prepare_model_for_lte, MultiheadReplicaLayer
+
 
 transformers.logging.set_verbosity_error()
 
@@ -44,13 +48,14 @@ def parse_args(args):
     parser.add_argument("--total_batch_size", type=int, default=None)
     parser.add_argument("--max_length", type=int, default=256)
     parser.add_argument("--optimizer", default="Adam")
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--optimizer_lr", type=float, default=1e-4)
     parser.add_argument("--scheduler", type=str, default="cosine", choices=["linear", "cosine", "cosine_restarts"])
     parser.add_argument("--min_lr_ratio", type=float, default=0.1)
     parser.add_argument("--activation_checkpointing", action="store_true")
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--warmup_steps", type=int, default=1_000)
     parser.add_argument("--eval_every", type=int, default=5_000)
+    parser.add_argument("--eval_tokens", type=int, default=100_000)
     parser.add_argument("--num_training_steps", type=int, default=10_000,
                         help="Number of **update steps** to train for. "
                              "Notice that gradient accumulation is taken into account.")
@@ -69,12 +74,20 @@ def parse_args(args):
     parser.add_argument("--beta1", type=float, default=0.0)
     
     # GaLore parameters
-    parser.add_argument("--rank", type=int, default=128)
-    parser.add_argument("--update_proj_gap", type=int, default=50)
+    parser.add_argument("--use_galore", default=True, action="store_true")
+    parser.add_argument("--galore_rank", type=int, default=128)
+    parser.add_argument("--galore_update_proj_gap", type=int, default=50)
     parser.add_argument("--galore_scale", type=float, default=1.0)
-    parser.add_argument("--proj_type", type=str, default="std")
+    parser.add_argument("--galore_proj_type", type=str, default="std")
+    parser.add_argument("--galore_DDP", default=False, action="store_true")
+
+    #LTE parameters
+    parser.add_argument("--use_LTE", default=False, action="store_true")
+    parser.add_argument("--LTE_rank", type=int, default=32)
+    parser.add_argument("--LTE_alpha", type=int, default=4096)
+    parser.add_argument("--LTE_num_heads", type=int, default=32)
     
-    # disable ddp, single_gpu
+    # disable ddp for now, single_gpu
     parser.add_argument("--single_gpu", default=False, action="store_true")
     
     args = parser.parse_args(args)
@@ -84,9 +97,9 @@ def parse_args(args):
 
 ####------------------ USE FOR INFERENCING ONLY ---------------------###
 @torch.no_grad()
-def evaluate_model(model, preprocess_batched, pad_idx, global_rank, world_size, device, batch_size):
+def evaluate_model(model, preprocess_batched, pad_idx, global_rank, world_size, device, batch_size, n_eval_tokens):
     _time = time.time()
-    val_data = datasets.load_dataset("c4", "en", split="validation", streaming=True) #DGX
+    val_data = datasets.load_dataset("allenai/c4", "en", split="validation", streaming=True, trust_remote_code=True) #DGX
     val_data = val_data.shuffle(seed=42)
     logger.info(f"Loaded validation dataset in {time.time() - _time:.2f} seconds")
 
@@ -100,7 +113,7 @@ def evaluate_model(model, preprocess_batched, pad_idx, global_rank, world_size, 
     )
     val_data_mapped.batch = lambda batch_size: training_utils.batch_fn(val_data_mapped, batch_size)
 
-    target_eval_tokens = 10_000_000
+    target_eval_tokens = n_eval_tokens #100_000 #1_000_000 #10_000_000
     evaluated_on_tokens = 0
     total_loss = torch.tensor(0.0).to(device)
     total_batches = 1
@@ -166,23 +179,26 @@ def main(args):
     logger.info("*" * 40)
     logger.info(f"Starting training with the arguments")
     for k, v in vars(args).items():
-        logger.info(f"{k:30} {v}")
+        logger.info(f"{k:30} {v}")        # print value of every parameter
     logger.info("*" * 40)
-    #-------------------------- Starting logger --------------------#
+    #-------------------------- end of Starting logger --------------------#
 
-    #-------------------------- Loading DATASET --------------------#
-    data = datasets.load_dataset("allenai/c4", "en", split="train", streaming=True)
-    seed_for_shuffle = 42 
+    #-------------------------- Loading DATASET and TOKENIZER --------------------#
+    # it doesn't matter which tokenizer we use, because we train from scratch
+    # T5 tokenizer was trained on C4 and we are also training on C4, so it's a good choice
+    data = datasets.load_dataset("allenai/c4", "en", split="train", streaming=True, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained("t5-base", model_max_length=args.max_length)
+    
+    #data = datasets.load_dataset("Trelis/tiny-shakespeare", "en", split="train", trust_remote_code=True)
+    #tokenizer = AutoTokenizer.from_pretrained('gpt2')
+
+    seed_for_shuffle = args.seed
     logger.info(f"Shuffling data with seed {seed_for_shuffle}")
     data: datasets.Dataset = data.shuffle(seed=seed_for_shuffle)
     if not args.single_gpu:
         data = datasets.distributed.split_dataset_by_node(
             data, rank=global_rank, world_size=world_size,
         )
-
-    # it doesn't matter which tokenizer we use, because we train from scratch
-    # T5 tokenizer was trained on C4 and we are also training on C4, so it's a good choice
-    tokenizer = AutoTokenizer.from_pretrained("t5-base", model_max_length=args.max_length)
 
     def preprocess_batched(batch):
         batch = tokenizer(
@@ -196,26 +212,48 @@ def main(args):
 
     dataset = PreprocessedIterableDataset(data, tokenizer, batch_size=args.batch_size, max_length=args.max_length)
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=None, num_workers=args.workers)
-    #-------------------------- Loading DATASET --------------------#
+    #-------------------------- end of Loading DATASET --------------------#
 
     #-------------------------- Specifying MODEL --------------------#
-    
-    with open(args.model_config) as f:
-        model_config = json.load(f)
-    if model_config["name"] == "gpt_nano":
-        model_args = model_config; del model_args['name']
-        print(model_args)
-        gptconf = GPTConfig(**model_args)
-        model = GPT(gptconf)
+    # with open(args.model_config) as f:
+    #     model_config = json.load(f)
+    # if model_config["name"] == "gpt_nano":
+    #     model_args = model_config; del model_args['name']
+    #     print(model_args)
+    #     gptconf = GPTConfig(**model_args)
+    #     model = GPT(gptconf)
+    # else:
+    #     model_config = AutoConfig.from_pretrained(args.model_config) 
+    model_config = AutoConfig.from_pretrained(args.model_config)
+    if args.use_hf_model: # use HuggingFace model?
+        model = AutoModelForCausalLM.from_config(model_config) # type(model): GPT2Model or HF_LlamaForCausalLM
     else:
-        model_config = AutoConfig.from_pretrained(args.model_config)
-        if args.use_hf_model:
-            model: HF_LlamaForCausalLM = AutoModelForCausalLM.from_config(model_config)
-        else:
-            model = LlamaForCausalLM(model_config)
+        if model_config.model_type == "llama":  
+            model_class = LlamaForCausalLM
+            model: LlamaForCausalLM = model_class(model_config)
+        elif model_config.model_type == "gpt2": 
+            model_class = GPT
+            model:GPT = model_class(model_config)
 
-    #-------------------------- Specifying MODEL --------------------#
+    #-------------------------- end of Specifying MODEL --------------------#
 
+    #-------------------------- TO DO: Activating Lora-The-Explorer LTE --------------------#
+    # if args.use_LTE:
+    #     logger.info(f"Enabling LTE on the {model_config.model_type} model")
+    #     model = prepare_model_for_lte(
+    #         model,
+    #         LTEConfig.default(
+    #             lora_r = args.LTE_rank,
+    #             lora_alpha = args.LTE_alpha,
+    #             num_heads = args.LTE_num_heads,
+    #         ),
+    #         mode='ddp',
+    #         strict=False,
+    #     ).double()
+
+    #-------------------------- end of Activating Lora-The-Explorer LTE --------------------#
+
+    #-------------------------- Reading pre-loaded model (not-needed yet) --------------------#
     if args.activation_checkpointing:
         model.gradient_checkpointing_enable()
 
@@ -254,13 +292,16 @@ def main(args):
         model = model.to(device=device, dtype=torch.bfloat16)
     else:
         model = model.to(device=device)
+    #-------------------------- end of Reading pre-loaded model (not-needed yet) --------------------#
 
+    #-------------------------- Activating Galore optimizer --------------------#
+        
     n_total_params = sum(p.numel() for p in model.parameters())
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     # Initialize wandb
     run_config = dict(vars(args))
     run_config.update({
-        "max_lr": run_config.pop("lr"),  # rename lr to max_lr to avoid conflicts with scheduler
+        "max_lr": run_config.pop("optimizer_lr"),  # rename lr to max_lr to avoid conflicts with scheduler
         "total_params_M": n_total_params / 1_000_000,
         "dataset": 'c4',
         "model": model_config.to_dict(),
@@ -270,7 +311,7 @@ def main(args):
 
     if global_rank == 0:
         wandb.config.update(run_config, allow_val_change=True)
-        wandb.save(os.path.abspath(__file__), policy="now") # save current script
+        wandb.save(os.path.abspath(__file__), policy="now", base_path=None) # save current script
         # fix tqdm visual length to 80 so that the progress bar
         # doesn't jump around when changing from external display to laptop
         pbar = tqdm(total=args.num_training_steps - update_step, desc="Update steps", ncols=80)
@@ -293,7 +334,7 @@ def main(args):
         regular_params = [p for p in model.parameters() if id(p) not in id_galore_params]
         # then call galore_adamw
         param_groups = [{'params': regular_params}, 
-                        {'params': galore_params, 'rank': args.rank, 'update_proj_gap': args.update_proj_gap, 'scale': args.galore_scale, 'proj_type': args.proj_type}]
+                        {'params': galore_params, 'rank': args.galore_rank, 'update_proj_gap': args.galore_update_proj_gap, 'scale': args.galore_scale, 'proj_type': args.galore_proj_type}]
         
     # print params and trainable params
     logger.info(f"\n{model}\n")
@@ -305,19 +346,19 @@ def main(args):
     
     layer_wise_flag = False
     if args.optimizer.lower() == "adam":
-        optimizer = torch.optim.Adam(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+        optimizer = torch.optim.Adam(trainable_params, lr=args.optimizer_lr, weight_decay=args.weight_decay)
     elif args.optimizer.lower() == "galore_adamw":
         # redefine way to call galore_adamw
-        optimizer = GaLoreAdamW(param_groups, lr=args.lr, weight_decay=args.weight_decay)
+        optimizer = GaLoreAdamW(param_groups, lr=args.optimizer_lr, weight_decay=args.weight_decay)
     # implement sgd
     elif args.optimizer.lower() == "sgd":
-        optimizer = torch.optim.SGD(trainable_params, lr=args.lr, weight_decay=args.weight_decay, momentum=args.beta1)
+        optimizer = torch.optim.SGD(trainable_params, lr=args.optimizer_lr, weight_decay=args.weight_decay, momentum=args.beta1)
     # implement adafactor
     elif args.optimizer.lower() == "adafactor":
         args.beta1 = None if args.beta1 == 0.0 else args.beta1
         optimizer = transformers.optimization.Adafactor(
             trainable_params,
-            lr=args.lr,
+            lr=args.optimizer_lr,
             eps=(1e-30, 1e-3),
             clip_threshold=1.0,
             decay_rate=-0.8,
@@ -332,7 +373,7 @@ def main(args):
         args.beta1 = None if args.beta1 == 0.0 else args.beta1
         optimizer = GaLoreAdafactor(
             param_groups,
-            lr=args.lr,
+            lr=args.optimizer_lr,
             eps=(1e-30, 1e-3),
             clip_threshold=1.0,
             decay_rate=-0.8,
@@ -344,18 +385,18 @@ def main(args):
         )
     # 8-bit Adam
     elif args.optimizer.lower() == "adam8bit":
-        optimizer = bnb.optim.Adam8bit(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+        optimizer = bnb.optim.Adam8bit(trainable_params, lr=args.optimizer_lr, weight_decay=args.weight_decay)
     elif args.optimizer.lower() == "galore_adamw8bit":
-        optimizer = GaLoreAdamW8bit(param_groups, lr=args.lr, weight_decay=args.weight_decay)
+        optimizer = GaLoreAdamW8bit(param_groups, lr=args.optimizer_lr, weight_decay=args.weight_decay)
     elif args.optimizer.lower() == 'galore_adamw8bit_per_layer':
         # TODO: seems scheduler call twice in one update step, need to check, for now double the num_training_steps, warmup_steps and update_proj_gap
         optimizer_dict = {}
         for p in model.parameters():
             if p.requires_grad:
                 if id(p) in id_galore_params:
-                    optimizer_dict[p] = GaLoreAdamW8bit([{'params': [p], 'rank': args.rank, 'update_proj_gap': args.update_proj_gap * 2, 'scale': args.galore_scale, 'proj_type': args.proj_type}], lr=args.lr, weight_decay=args.weight_decay)
+                    optimizer_dict[p] = GaLoreAdamW8bit([{'params': [p], 'rank': args.galore_rank, 'update_proj_gap': args.galore_update_proj_gap * 2, 'scale': args.galore_scale, 'proj_type': args.galore_proj_type}], lr=args.optimizer_lr, weight_decay=args.weight_decay)
                 else:
-                    optimizer_dict[p] = bnb.optim.Adam8bit([p], lr=args.lr, weight_decay=args.weight_decay)
+                    optimizer_dict[p] = bnb.optim.Adam8bit([p], lr=args.optimizer_lr, weight_decay=args.weight_decay)
 
         # get scheduler dict
         scheduler_dict = {}
@@ -403,15 +444,17 @@ def main(args):
             broadcast_buffers=False,
         )
 
+    #-------------------------- end of Activating Galore optimizer --------------------#
+
     # global steps and others are defined above
     pad_idx = tokenizer.pad_token_id
     update_time = time.time()
     local_step = 0  # when continue_from is used, local_step != global_step
 
-    # ##############################
+    # ##########################################################################################
     # TRAINING LOOP
     # we'll never go through all the data, so no need for epochs
-    # ##############################
+    # ##########################################################################################
 
     for batch_idx, batch in enumerate(dataloader):
 
@@ -427,10 +470,11 @@ def main(args):
         labels = batch["input_ids"].clone()
         labels[labels == pad_idx] = -100
         tokens_seen += (batch["input_ids"] != pad_idx).sum().item() * world_size
-
-        loss = model(**batch, labels=labels).loss
+        
+        out = model(**batch, labels=labels)
+        loss = out.loss
         scaled_loss = loss / args.gradient_accumulation
-        scaled_loss.backward()
+        scaled_loss.backward() # does x.grad += dloss/dx for every x that requires_grad=True
 
         if global_step % args.gradient_accumulation != 0:
             continue
@@ -533,7 +577,6 @@ def main(args):
     if global_rank == 0 and not os.path.exists(current_model_directory):
         logger.info(f"Saving model and optimizer to {current_model_directory}, update step {update_step}")
         os.makedirs(args.save_dir, exist_ok=True)
-        print(type(model))
         model.save_pretrained(current_model_directory)
 
         optimizer_checkpoint = {
@@ -565,7 +608,7 @@ def main(args):
     torch.cuda.empty_cache()
 
     total_loss, evaluated_on_tokens = evaluate_model(
-        model, preprocess_batched, pad_idx, global_rank, world_size, device, args.batch_size
+        model, preprocess_batched, pad_idx, global_rank, world_size, device, args.batch_size, args.eval_tokens
     )
 
     if global_rank == 0:

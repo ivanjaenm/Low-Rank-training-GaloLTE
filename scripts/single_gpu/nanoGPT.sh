@@ -5,10 +5,12 @@
 torchrun --nproc_per_node 1 torchrun_main.py \
     --model_config configs/nanogpt.json \
     --seed 0 \
-    --lr 0.005 \
+    --use_galore \
+    --optimizer galore_adamw8bit \
+    --optimizer_lr 0.005 \
+    --galore_rank 1024 \
+    --galore_update_proj_gap 500 \
     --galore_scale 0.25 \
-    --rank 1024 \
-    --update_proj_gap 500 \
     --batch_size 1 \
     --total_batch_size 512 \
     --num_training_steps 2 \
@@ -17,6 +19,10 @@ torchrun --nproc_per_node 1 torchrun_main.py \
     --grad_clipping 1.0 \
     --dtype bfloat16 \
     --eval_every 1000 \
+    --eval_tokens 100000 \
     --single_gpu \
-    --optimizer galore_adafactor \
-    --save_dir /dev/shm/checkpoints/nanogpt
+#    --use_LTE \
+#    --LTE_rank 32 \
+#    --LTE_alpha 4096 \
+#    --LTE_num_heads 32 \
+#    --save_dir /dev/shm/checkpoints/nanogpt

@@ -1,3 +1,7 @@
 torch
 transformers
 bitsandbytes
+datasets
+wandb
+loguru
+yacs

@@ -5,6 +5,10 @@ Low-rank adaptation (LoRA) was originally proposed for fine-tuning by reparamete
 * Fine-tuning vision transformers (ViTs) with LoRA acheives better accuracy with less number of epochs compared to full parameter fine-tuning. 
 * Applying LoRA on attention layers is most effective and a good balance between model performance and number of trainable parameters. 
 
+## Poster Presentation
+
+<img width="961" alt="image" src="https://github.com/user-attachments/assets/030ba5ae-fdde-4204-a694-d95fbaaab868">
+
 ## LTE tasks
 
 Sources: 

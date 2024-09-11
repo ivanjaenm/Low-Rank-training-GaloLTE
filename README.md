@@ -1,13 +1,13 @@
+## Poster Presentation
+
+<img width="961" alt="image" src="https://github.com/user-attachments/assets/030ba5ae-fdde-4204-a694-d95fbaaab868">
+
 # Lowrank Training 
 
 Low-rank adaptation (LoRA) was originally proposed for fine-tuning by reparameterizing weight with its factorization of two lower-dimensional matrices A and B. In pre-training, low-rank adaptation does not achieve performance similar to full parameter training. Recent works have extended LoRA to improve its performance. LoRA-The-Explorer (LTE) suggested tranining multiple LoRA heads in parallel. GaLore projects gradients into lower-dimensional matrices and updates weights in a smaller subspace. In this project, we have applied LTE and GaLore methods in foundation models for language and vision tasks to validate their effectiveness. Our key results are as follows-
 * Using multiple heads with a small rank can perform same as or slightly better than full-parameter training of GPT model.
 * Fine-tuning vision transformers (ViTs) with LoRA acheives better accuracy with less number of epochs compared to full parameter fine-tuning. 
 * Applying LoRA on attention layers is most effective and a good balance between model performance and number of trainable parameters. 
-
-## Poster Presentation
-
-<img width="961" alt="image" src="https://github.com/user-attachments/assets/030ba5ae-fdde-4204-a694-d95fbaaab868">
 
 ## LTE tasks
 
